@@ -5,7 +5,7 @@ import inspect
 import logging
 import os
 import time
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from contextlib import nullcontext
 from dataclasses import fields, is_dataclass
 from enum import Enum
@@ -144,6 +144,30 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
     from megatron.core.transformer.transformer_block import get_num_layers_to_build
     from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
+    # Handle Flux layers without circular imports
+    # Flux has two type of TransformerLayer, we can't reuse
+    class_name = base_module.__class__.__name__
+    if class_name in ["MMDiTLayer", "FluxSingleTransformerBlock"]:
+        # PP for Flux has never been verified
+        vpp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        if vpp_size is not None:
+            raise NotImplementedError("Pipeline parallelism with Flux layers is not yet supported")
+
+        # Determine layer count based on layer type
+        if class_name == "MMDiTLayer":
+            num_layers = getattr(base_module.config, 'num_joint_layers', None)
+        else:  # FluxSingleTransformerBlock
+            num_layers = getattr(base_module.config, 'num_single_layers', None)
+
+        if num_layers is None:
+            # Fallback to standard layer detection if config fields don't exist
+            pass  # Continue to standard logic below
+        else:
+            return (
+                base_module.layer_number == 1,
+                base_module.layer_number == num_layers,
+            )
+
     # find all first/last layers of this PP stage
     first_layer_numbers = []
     last_layer_numbers = []
@@ -170,7 +194,7 @@ class _CudagraphGlobalRecord:
     fwd and bwd passes will be performed using their cudagraphed versions."""
     cudagraph_created = False
 
-    """A record of fwd and bwd graph creation, populated with 'record_fwd_graph' and 
+    """A record of fwd and bwd graph creation, populated with 'record_fwd_graph' and
     'record_bwd_graph."""
     cudagraph_record = []
 
@@ -225,8 +249,9 @@ class _CudagraphGlobalRecord:
             [g[0].reuse_input_output_buffer for g in cls.cudagraph_record]
         )
         if optimize_transformer_layer_graph_buffers:
-            prev_fwd_hidden_state_output = None
-            prev_bwd_hidden_state_inputgrad = None
+            # Generic tracking of previous outputs and gradients for buffer reuse
+            prev_fwd_outputs = OrderedDict()
+            prev_bwd_input_grads = OrderedDict()
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -265,28 +290,70 @@ class _CudagraphGlobalRecord:
                 if graph_type == 'fwd':
                     args, kwargs = g[2:]
 
-                    if not runner.is_first_layer:
-                        kwargs['hidden_states'] = prev_fwd_hidden_state_output
-                    runner.create_fwd_graph(args, kwargs, clone_inputs=False)
+                    # Flux has 19xMMDiTLayer followed by 38xFluxSingleTransformerBlock,
+                    # we need to reset the buffer at the transition from MMDiTLayer to FluxSingleTransformerBlock
+                    # and from FluxSingleTransformerBlock to MMDiTLayer.
+                    if runner.is_first_layer:
+                        prev_fwd_outputs.clear()
+                    else:
+                        # Reuse outputs based on explicit configuration
+                        for key in runner.share_cudagraph_io_buffers:
+                            if key in kwargs and key in prev_fwd_outputs and prev_fwd_outputs[key] is not None:
+                                kwargs[key] = prev_fwd_outputs[key]
 
-                    # The output of TransformerLayer is: (hidden_states, None)
-                    # The output of MambaLayer is: (hidden_states,)
-                    # make sure to get the hidden states tensor from the tuple
-                    prev_fwd_hidden_state_output = runner.fwd_graph_outputs[0]
+                    # Create forward graph with tensor processing based on share_cudagraph_io_buffers
+                    runner.create_fwd_graph(args, kwargs)
+
+                    # Track outputs based on explicit configuration
+                    prev_fwd_outputs.clear()  # Reset for this layer
+                    for i, key in enumerate(runner.share_cudagraph_io_buffers):
+                        if i < len(runner.fwd_graph_outputs):
+                            output = runner.fwd_graph_outputs[i]
+                            # Only track valid tensor outputs
+                            if output is not None and torch.is_tensor(output):
+                                prev_fwd_outputs[key] = output
 
                 else:
                     # In vision models, encoder and decoder transformers have different
                     # hidden_states shapes. Each has its own first and last layers that
-                    # are noncontiguous. Reset prev_bwd_hidden_state_inputgrad to None at
-                    # each last layer to avoid shape mismatch when transitioning between
-                    # encoder and decoder.
+                    # are noncontiguous. Reset gradient tracking at each last layer to avoid
+                    # shape mismatch when transitioning between encoder and decoder.
                     if runner.is_last_layer:
-                        prev_bwd_hidden_state_inputgrad = None
+                        prev_bwd_input_grads.clear()
 
-                    runner.create_bwd_graph(prev_bwd_hidden_state_inputgrad)
 
-                    # The first input grad TransformerLayer is for 'hidden_states'
-                    prev_bwd_hidden_state_inputgrad = runner.static_grad_inputs[0]
+                    # Create backward graph with proper gradient reuse
+                    # We need to pass gradients in the same order as the forward outputs
+                    if prev_bwd_input_grads:
+                        # Construct gradients in the order that matches forward outputs
+                        # The key insight: static_grad_outputs must match fwd_graph_output_surface structure
+                        reused_grad_outputs = []
+                        for i, key in enumerate(runner.share_cudagraph_io_buffers):
+                            if i < len(runner.fwd_graph_outputs):
+                                # Use reused gradient if available, otherwise None (will be generated)
+                                reused_grad = prev_bwd_input_grads.get(key, None)
+                                reused_grad_outputs.append(reused_grad)
+
+                        # Only pass reused gradients if we have any, and ensure structure matches forward outputs
+                        if any(g is not None for g in reused_grad_outputs) and len(reused_grad_outputs) == len(runner.fwd_graph_outputs):
+                            if len(reused_grad_outputs) == 1:
+                                runner.create_bwd_graph(reused_grad_outputs[0])
+                            else:
+                                runner.create_bwd_graph(tuple(reused_grad_outputs))
+                        else:
+                            # No reusable gradients or structure mismatch - generate naturally
+                            runner.create_bwd_graph()
+                    else:
+                        # First layer or no previous gradients - generate naturally
+                        runner.create_bwd_graph()
+
+                    # Track gradients for next layer's reuse
+                    prev_bwd_input_grads.clear()
+                    for i, key in enumerate(runner.share_cudagraph_io_buffers):
+                        if i < len(runner.static_grad_inputs):
+                            grad = runner.static_grad_inputs[i]
+                            if grad is not None and torch.is_tensor(grad):
+                                prev_bwd_input_grads[key] = grad
             else:
                 runner, graph_type = g[0:2]
                 if graph_type == 'fwd':
@@ -498,7 +565,7 @@ class _CudaGraphRunner(torch.nn.Module):
         """Creates a _CudaGraphRunner, which holds a single pair of fwd and bwd cudagraphs, which
         are not created until this runner records its graph creation into
         '_CudagraphGlobalRecord', and 'create_cudagraphs()' is called. share_cudagraph_io_buffers
-        is a boolean flag to indicate whether to reuse the cudagraph input and output buffers for
+        is a boolean flag or list to indicate whether to reuse the cudagraph input and output buffers for
         transformer layer specific optimizations that reduce memory usage and tensor copies."""
 
         super().__init__()
@@ -511,6 +578,15 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph_input_kwarg_metas = {
             k: ArgMetadata(a) for k, a in fwd_graph_input_kwargs.items()
         }
+
+        # Parse share_cudagraph_io_buffers parameter - store as list internally
+        if isinstance(share_cudagraph_io_buffers, bool):
+            self.share_cudagraph_io_buffers = ['hidden_states'] if share_cudagraph_io_buffers else []
+        elif isinstance(share_cudagraph_io_buffers, list):
+            self.share_cudagraph_io_buffers = share_cudagraph_io_buffers
+        else:
+            # Default for None or other values
+            self.share_cudagraph_io_buffers = ['hidden_states']
 
         self.fwd_graph = None
         self.bwd_graph = None
@@ -542,7 +618,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.is_transformer_decoder_layer = _determine_if_transformer_decoder_layer(base_module)
         self.reuse_input_output_buffer = (
-            share_cudagraph_io_buffers and self.is_transformer_decoder_layer
+            bool(self.share_cudagraph_io_buffers) and self.is_transformer_decoder_layer
         )
         if self.reuse_input_output_buffer:
             self.is_first_layer, self.is_last_layer = (
@@ -552,9 +628,22 @@ class _CudaGraphRunner(torch.nn.Module):
             self.is_first_layer, self.is_last_layer = True, True
 
     def __str__(self):
-        return "%s; hid %s" % (
+        # Show all shared IO buffers with their shapes
+        if self.share_cudagraph_io_buffers:
+            buffer_info = []
+            for key in self.share_cudagraph_io_buffers:
+                if key in self.fwd_graph_input_kwarg_metas:
+                    shape = tuple(self.fwd_graph_input_kwarg_metas[key].shape)
+                    buffer_info.append(f"{key} {shape}")
+                else:
+                    buffer_info.append(f"{key} (unknown)")
+            buffers_str = ", ".join(buffer_info)
+        else:
+            buffers_str = "no shared buffers"
+
+        return "%s; %s" % (
             self.base_module.__class__.__name__,
-            tuple(self.fwd_graph_input_kwarg_metas["hidden_states"].shape),
+            buffers_str,
         )
 
     def get_fp8_context(self):
@@ -570,8 +659,11 @@ class _CudaGraphRunner(torch.nn.Module):
 
         # Initialize inference context.
         if inference_context and inference_context.is_dynamic_batching():
-            num_warmup_requests = kwargs["hidden_states"].size(0)
-            inference_context.initialize_attention_state(num_warmup_requests=num_warmup_requests)
+            # Use the first shared IO buffer key to get batch size, fallback to 'hidden_states'
+            batch_size_key = self.share_cudagraph_io_buffers[0] if self.share_cudagraph_io_buffers else 'hidden_states'
+            if batch_size_key in kwargs:
+                num_warmup_requests = kwargs[batch_size_key].size(0)
+                inference_context.initialize_attention_state(num_warmup_requests=num_warmup_requests)
 
         context = (
             torch.cuda.graph(cuda_graph=graph, pool=pool) if graph is not None else nullcontext()
@@ -587,9 +679,14 @@ class _CudaGraphRunner(torch.nn.Module):
 
         return outputs
 
-    def create_fwd_graph(self, args, kwargs, clone_inputs=True):
+    def create_fwd_graph(self, args, kwargs):
         """Create a fwd cudagraph for this runner. Should be called inside
-        'create_cudagraphs()'."""
+        'create_cudagraphs()'.
+
+        Tensor processing behavior is determined by share_cudagraph_io_buffers:
+        - If share_cudagraph_io_buffers is empty (disabled), all tensors are zeroed out
+        - If share_cudagraph_io_buffers is not empty (enabled), only tensors NOT listed in it are zeroed out
+        """
 
         # save grads and other variables that may be affected by graph warmup
         if self.training and torch.is_grad_enabled():
@@ -607,8 +704,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     [self.base_module], self.fp8_recipe.amax_history_len
                 )
 
-        if clone_inputs:
-            args, kwargs = self.zero_out_tensors(args, kwargs)
+        args, kwargs = self.zero_out_tensors(args, kwargs)
 
         input_tensors = self.get_tensors(args, kwargs)
         self.fwd_graph_input_surface = input_tensors + tuple(self.base_module.parameters())
@@ -652,8 +748,8 @@ class _CudaGraphRunner(torch.nn.Module):
         if self.training and torch.is_grad_enabled():
             assert (
                 len(self.fwd_graph_output_surface) > 0
-            ), """Tried graphing a moudule that returned no tensors in training mode, 
-                however the graphed module must output at least one tensor, 
+            ), """Tried graphing a moudule that returned no tensors in training mode,
+                however the graphed module must output at least one tensor,
                 so that a corresponding backward node may be registered in the autograd graph."""
 
             # restore cached grads
@@ -775,7 +871,10 @@ class _CudaGraphRunner(torch.nn.Module):
                 # transformer layers hidden_states are already saved as the output of the previous
                 # layer's cudagraph so avoid saving again
                 kwargs_copy = dict(kwargs)
-                kwargs_copy['hidden_states'] = None
+                # For shared IO buffer layers, avoid saving any shared keys since they will be reused
+                for key in self.share_cudagraph_io_buffers:
+                    if key in kwargs_copy:
+                        kwargs_copy[key] = None
                 _CudagraphGlobalRecord.record_fwd_graph(self, args, kwargs_copy)
             else:
                 _CudagraphGlobalRecord.record_fwd_graph(self, args, kwargs)
@@ -888,36 +987,44 @@ class _CudaGraphRunner(torch.nn.Module):
 
         return errors
 
+
     def zero_out_tensors(self, args, kwargs=None):
-        """Replace all tensors inside arg, kwargs with zeroed copies."""
+        """Zero out tensors based on share_cudagraph_io_buffers configuration.
 
-        def clone_tensor(ten):
-            cloned = torch.zeros_like(ten)
-            cloned.requires_grad = ten.requires_grad
-            return cloned
+        - If share_cudagraph_io_buffers is disabled: zero out all tensors
+        - If share_cudagraph_io_buffers is enabled: zero out only tensors NOT in it
+        """
+        def zero_tensor_if_needed(tensor, key_name):
+            should_zero = not self.share_cudagraph_io_buffers or (key_name and key_name not in self.share_cudagraph_io_buffers)
+            if should_zero:
+                cloned = torch.zeros_like(tensor)
+                cloned.requires_grad = tensor.requires_grad
+                return cloned
+            return tensor
 
-        def process_arg(arg):
+        def process_arg(arg, key_name=None):
             _check_supported_type(ArgMetadata(arg))
             if torch.is_tensor(arg):
-                return clone_tensor(arg)
+                return zero_tensor_if_needed(arg, key_name)
             elif is_dataclass(arg):
                 for field in fields(arg):
                     attr = getattr(arg, field.name)
                     if torch.is_tensor(attr):
-                        setattr(arg, field.name, clone_tensor(attr))
+                        setattr(arg, field.name, zero_tensor_if_needed(attr, field.name))
             return arg
 
-        args_replaced = []
-        for arg in args:
-            args_replaced.append(process_arg(arg))
+        # Process args - positional args have no key names, so they're always zeroed out
+        args_processed = [process_arg(arg) for arg in args]
+
         if kwargs is None:
-            return args_replaced
+            return args_processed
 
-        kwargs_replaced = {}
+        # Process kwargs
+        kwargs_processed = {}
         for k, v in kwargs.items():
-            kwargs_replaced[k] = process_arg(v)
+            kwargs_processed[k] = process_arg(v, key_name=k)
 
-        return args_replaced, kwargs_replaced
+        return args_processed, kwargs_processed
 
     @classmethod
     def get_tensors(cls, args, kwargs=None):
@@ -965,7 +1072,7 @@ class CudaGraphManager(torch.nn.Module):
     def __init__(
         self,
         config: TransformerConfig,
-        share_cudagraph_io_buffers: bool = True,
+        share_cudagraph_io_buffers: bool | list = True,
         vp_stage: Optional[int] = None,
     ):
         super().__init__()
@@ -974,13 +1081,28 @@ class CudaGraphManager(torch.nn.Module):
         Args:
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8, and warmup steps.
-            share_cudagraph_io_buffers (bool, optional): (DEPRECATED, will be replaced by
-                config.cuda_graph_share_io_buffers) If None (default) or True, enables 
-                buffer reuse optimizations for transformer and mamba layers. If False,
-                disables buffer reuse.
+            share_cudagraph_io_buffers (bool | list, optional): (DEPRECATED, will be replaced by
+                config.cuda_graph_share_io_buffers) Controls buffer reuse optimizations that reduce
+                memory usage and tensor copies. This optimization allows layers to reuse
+                the same input/output buffers by alternating between them. Can be:
+                - True (default): Enable buffer reuse for ['hidden_states'] (backward compatible)
+                - False: Disable buffer reuse
+                - list: Enable buffer reuse for specified keys
+                        e.g. ['hidden_states', 'encoder_hidden_states']
+                When enabled, reduces memory usage because the next layer consumes the previous
+                layer's outputs, so forward cudagraphs can alternate reusing the same buffers.
+                Similarly, backward graphs can alternate the same gradient buffers.
         """
         rng_tracker = get_cuda_rng_tracker()
-        self.share_cudagraph_io_buffers = share_cudagraph_io_buffers
+
+        # Parse share_cudagraph_io_buffers parameter - store as list internally
+        if isinstance(share_cudagraph_io_buffers, bool):
+            self.share_cudagraph_io_buffers = ['hidden_states'] if share_cudagraph_io_buffers else []
+        elif isinstance(share_cudagraph_io_buffers, list):
+            self.share_cudagraph_io_buffers = share_cudagraph_io_buffers
+        else:
+            raise ValueError(f"share_cudagraph_io_buffers must be bool or list, got {type(share_cudagraph_io_buffers)}")
+
         self.vp_stage = vp_stage
 
         # need to delay the import here to avoid a circular import
