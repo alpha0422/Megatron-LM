@@ -1084,7 +1084,7 @@ def setup_model_and_optimizer(
         # set dense model related args in to global args before getting dense model
         args.num_experts = None
         args.expert_model_parallel_size = 1
-        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity 
+        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
         # get dense model
         dense_model_for_upcycling = get_model(model_provider_func, model_type)
@@ -1987,7 +1987,11 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
     if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            reuse_mempool=args.cuda_graph_full_iteration_reuse_mempool
+        )
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -2344,7 +2348,11 @@ def evaluate(
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
     if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            reuse_mempool=args.cuda_graph_full_iteration_reuse_mempool
+        )
 
     if eval_iters is None:
         eval_iters = args.eval_iters
@@ -2491,7 +2499,7 @@ def evaluate_and_print_results(
         eval_iters = [args.eval_iters]
     else:
         eval_iters = args.eval_iters
-        
+
     if args.full_validation:
         assert len(eval_iters) == len(data_iterators)
 
@@ -2503,7 +2511,7 @@ def evaluate_and_print_results(
         torch.distributed.broadcast(eval_iters, 0)
         eval_iters = eval_iters.tolist()
         args.eval_iters = eval_iters[0] if not args.multiple_validation_sets else eval_iters
-    
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
@@ -2620,7 +2628,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             build_train_valid_test_datasets_provider
         )
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-        
+
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
 
@@ -2692,7 +2700,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
         train_data_iterator = None
 
     # when using full validation, we need to override eval iters with the correct
-    # number of iterations on tp rank 0 so that it can be distributed to the other 
+    # number of iterations on tp rank 0 so that it can be distributed to the other
     # ranks later
     if args.full_validation:
         if args.multiple_validation_sets:

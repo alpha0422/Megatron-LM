@@ -97,11 +97,19 @@ class FullCudaGraphWrapper:
     curr_iteration = {'training': 0, 'validation': 0}
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
+    # Shared memory pool for training and validation when reuse is enabled
+    shared_mempool = None
 
-    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1):
+    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, reuse_mempool=False):
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
+        self.reuse_mempool = reuse_mempool
+
+        # Initialize shared memory pool if reuse is enabled
+        if self.reuse_mempool and FullCudaGraphWrapper.shared_mempool is None:
+            FullCudaGraphWrapper.shared_mempool = torch.cuda.graph_pool_handle()
+            logger.info("Created shared memory pool for full iteration CUDA graph reuse")
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -169,9 +177,15 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = torch.cuda.Stream()
+
+            # Use shared memory pool if reuse is enabled, otherwise use default pool
+            pool = FullCudaGraphWrapper.shared_mempool if self.reuse_mempool else None
+            if self.reuse_mempool:
+                logger.info(f'Using shared memory pool for {training_str} CUDA graph capture')
             with torch.cuda.graph(
                 FullCudaGraphWrapper.cuda_graph[training_str],
                 stream=capture_stream,
+                pool=pool,
                 capture_error_mode="thread_local",
             ):
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
