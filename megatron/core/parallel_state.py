@@ -738,6 +738,7 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
 
     assert (
@@ -779,8 +780,29 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
 
-        if num_distributed_optimizer_instances > 1:
-            # Create groups for intra-partial DP domain
+        if num_distributed_optimizer_instances > 1 and expert_model_parallel_size == 1:
+            # For non-expert case with multiple distributed optimizer instances,
+            # use hierarchical group creation (same approach as expert parallelism)
+            hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups(
+                rank,
+                ranks_with_cp,
+                [intra_partial_data_parallel_size, num_distributed_optimizer_instances],
+                create_gloo_process_groups=create_gloo_process_groups,
+                pg_options=[
+                    get_nccl_options("intra_dp_cp", nccl_comm_cfgs),
+                    get_nccl_options("inter_dp_cp", nccl_comm_cfgs),
+                ],
+                timeout=timeout,
+                group_desc="DATA_PARALLEL_GROUP_WITH_CP",
+            )
+            if rank in ranks_with_cp:
+                # Set both intra and inter distributed optimizer groups
+                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = hierarchical_groups[0]
+                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = hierarchical_groups_gloo[0]
+                # Use the same variable as expert parallelism for inter-distributed optimizer groups
+                _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[1]
+        elif num_distributed_optimizer_instances > 1:
+            # Expert parallelism case - create groups manually (original logic)
             for i in range(num_distributed_optimizer_instances):
                 intra_partial_dp_ranks_with_cp = ranks_with_cp[
                     (i * intra_partial_data_parallel_size) : (
@@ -808,6 +830,7 @@ def initialize_model_parallel(
                         intra_partial_dp_group_with_cp_gloo
                     )
         else:
+            # Single distributed optimizer instance case
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
 
@@ -1140,11 +1163,6 @@ def initialize_model_parallel(
     assert (
         _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is None
     ), "Intra partial expert data group-gloo is already initialized"
-    global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
-    assert (
-        _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is None
-    ), "Inter partial expert data group is already initialized"
-
     assert (
         expert_data_parallel_size % num_distributed_optimizer_instances == 0
     ), "Expert data parallel size should be divisible by partial DistOpt shard factor"
@@ -1169,9 +1187,14 @@ def initialize_model_parallel(
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
 
-        if num_distributed_optimizer_instances > 1:
+        if num_distributed_optimizer_instances > 1 and expert_model_parallel_size > 1:
+            # Only assert and initialize if we're actually using expert parallelism
+            assert (
+                _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is None
+            ), "Inter partial expert data group is already initialized"
             # Create groups for Partial DistOpt, one for intra-partial DP domain
             # Another for inter-partial DP domain
+            # Only create expert-specific inter-distributed optimizer groups when actually using expert parallelism
 
             # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp_replica group.
             if sharp_enabled_group == "dp_replica":
